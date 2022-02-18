@@ -22,16 +22,20 @@ import java.io.IOException;
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.net.URL;
+import java.nio.file.FileSystem;
+import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.function.Function;
@@ -65,6 +69,7 @@ public class MappingToy {
     public static void main(String[] args) throws SecurityException, IOException {
         OptionParser parser = new OptionParser();
         OptionSpec<String>  versionO   = parser.accepts("version").withRequiredArg();
+        OptionSpec<URL>     zipO       = parser.accepts("zip").withRequiredArg().ofType(URL.class);
         OptionSpec<Path>    outputO    = parser.accepts("output").withRequiredArg().withValuesConvertedBy(new PathConverter()).defaultsTo(Paths.get("output"));
         OptionSpec<Path>    minecraftO = parser.accepts("mc").withRequiredArg().withValuesConvertedBy(new PathConverter()).defaultsTo(Utils.findMinecraftHome());
         OptionSpec<Void>    allO       = parser.accepts("all");
@@ -74,6 +79,7 @@ public class MappingToy {
 
         OptionSet options = parser.parse(args);
         Set<MinecraftVersion> versions = options.valuesOf(versionO).stream().map(MinecraftVersion::from).collect(Collectors.toCollection(TreeSet::new));
+        List<URL> zipUrls = options.valuesOf(zipO);
         Path         output       = options.valueOf(outputO);
         Path         minecraft    = options.valueOf(minecraftO);
         boolean      all          = options.has(allO);
@@ -139,6 +145,7 @@ public class MappingToy {
         log.info("All:       " + all);
         log.info("Libs:      " + libs);
         log.info("Versions:  " + (versions.isEmpty() ? "All" : versions));
+        log.info("Zips:      " + zipUrls);
         log.info("Force:     " + force);
         log.info("");
 
@@ -151,11 +158,44 @@ public class MappingToy {
         if (versions.isEmpty())
             versions.addAll(manifest_json.getEntries().keySet());
 
+        Map<MinecraftVersion, VersionJson> extraManifests = new HashMap<>();
+
+        for (URL zipUrl : zipUrls) {
+            Path rootPath = downloadZip(output, zipUrl);
+            if (rootPath == null)
+                continue;
+
+            Optional<Path> dirPathOpt = Files.list(rootPath).filter(Files::isDirectory).findAny();
+            if (!dirPathOpt.isPresent())
+                continue;
+
+            Optional<Path> jsonPathOpt = Files.list(dirPathOpt.get())
+                    .filter(Files::isRegularFile)
+                    .filter(path -> Files.isRegularFile(path) && path.getFileName().toString().endsWith(".json"))
+                    .findAny();
+            if (!jsonPathOpt.isPresent())
+                continue;
+
+            Path path = jsonPathOpt.get();
+            VersionJson manifest = MappingToy.readVersionJson(path);
+            if (manifest == null)
+                continue;
+
+            try {
+                MinecraftVersion ver = MinecraftVersion.from(manifest.id);
+                extraManifests.put(ver, manifest);
+            } catch (Exception e) {
+                log.log(Level.WARNING, "Failed to parse minecraft version: " + e.getMessage(), e);
+            }
+        }
+
         for (MinecraftVersion ver : versions) {
             log.log(Level.INFO, "Processing " + ver.toString() + ":");
 
+            VersionJson manifest = extraManifests.get(ver);
+
             ManifestJson.Entry mainEntry = manifest_json.getVersion(ver);
-            if (mainEntry == null || mainEntry.url == null) {
+            if (manifest == null && (mainEntry == null || mainEntry.url == null)) {
                 log.log(Level.INFO, "  No entry in Launcher Manifest");
                 continue;
             }
@@ -163,7 +203,19 @@ public class MappingToy {
             Path root = output.resolve(ver.toString());
             Files.createDirectories(root);
 
-            VersionJson manifest = downloadVersionJson(root, mainEntry.url);
+            if (manifest == null) {
+                manifest = downloadVersionJson(root, mainEntry.url);
+            } else {
+                try {
+                    // We need to write the json from the zip out to the standard location
+                    Path target = root.resolve("version.json");
+                    Utils.writeJson(target, manifest);
+                } catch (Exception e) {
+                    log.log(Level.WARNING, "    Failed to write version.json: " + e.getMessage(), e);
+                    continue;
+                }
+            }
+
             if (manifest == null)
                 continue;
 
@@ -209,6 +261,23 @@ public class MappingToy {
         log.info("Finished");
     }
 
+    private static Path downloadZip(Path output, URL zipUrl) {
+        String filename = zipUrl.getPath().substring(zipUrl.getPath().lastIndexOf('/') + 1);
+        Path zipPath = output.resolve(filename);
+        if (!Utils.downloadFileEtag(zipPath, zipUrl, false, "Downloading: ")) {
+            log.info("    Failed, Exiting");
+            return null;
+        }
+
+        try {
+            FileSystem zipFs = FileSystems.newFileSystem(zipPath, null);
+            return zipFs.getPath("/");
+        } catch (Exception e) {
+            log.log(Level.WARNING, "    Failed to read zip file: " + e.getMessage(), e);
+            return null;
+        }
+    }
+
     private static ManifestJson downloadLauncherManifest(Path output) {
         Path manifest = output.resolve("launcher_manifest.json");
         if (!Utils.downloadFileEtag(manifest, ManifestJson.MOJANG_URL, false, "Downloading: ")) {
@@ -233,6 +302,10 @@ public class MappingToy {
             return null;
         }
 
+        return readVersionJson(target);
+    }
+
+    private static VersionJson readVersionJson(Path target) {
         try {
             return Utils.loadJson(target, VersionJson.class);
         } catch (Exception e) {
